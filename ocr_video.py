@@ -1,381 +1,469 @@
-# =============================================================================
-# Real-Time OCR System for Video-Based Text Recognition
-# in Traffic and Surveillance
-# =============================================================================
-# 
-# HOW TO USE:
-#   1. Run the script: python ocr_video.py
-#   2. Video will play in "Real-Time OCR Video" window
-#   3. Click and DRAG your mouse to draw a rectangle on any text area
-#   4. The selected region will be ZOOMED in "Zoomed Text Region" window
-#   5. OCR text will appear in GREEN on the zoomed view
-#   6. Press 'c' to clear selection, press 'q' to quit
-# =============================================================================
+"""
+Real-Time OCR System for Video-Based Text Recognition
+Standalone OpenCV app using PaddleOCR.
 
-import cv2
-import pytesseract
-import numpy as np
+Controls:
+  - Press 'a' to toggle auto-detect mode
+  - Click and drag to select a region (manual mode)
+  - Press 'c' to clear manual selection
+  - Press 'q' to quit
+"""
+
 import os
+os.environ.setdefault("FLAGS_use_pir", "0")
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+import cv2  # type: ignore
+import re
 import sys
+import time
 
-# ─── Tesseract Setup ─────────────────────────────────────────────────────────
-def setup_tesseract():
-    """Find and configure Tesseract OCR executable."""
-    common_paths = [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    ]
-    for path in common_paths:
-        if os.path.exists(path):
-            pytesseract.pytesseract.tesseract_cmd = path
-            print(f"[INFO] Tesseract found at: {path}")
-            return True
-    # Check system PATH
-    try:
-        pytesseract.get_tesseract_version()
-        print("[INFO] Tesseract found on system PATH.")
-        return True
-    except Exception:
-        pass
-    print("[ERROR] Tesseract not found! Install from: https://github.com/tesseract-ocr/tesseract")
-    return False
+from paddleocr import PaddleOCR  # type: ignore
 
+MIN_CONFIDENCE = 0.15
+MIN_TEXT_LENGTH = 1
+FRAME_SKIP = 8
+OCR_DET_LIMIT_SIDE = 1280
+OCR_DET_THRESH = 0.20
+OCR_DET_BOX_THRESH = 0.30
+OCR_DET_UNCLIP = 1.6
+OCR_REC_SCORE_THRESH = 0.20
+OCR_UPSCALE_MAX = 1280
 
-# ─── Video Input ──────────────────────────────────────────────────────────────
+PLATE_ONLY_MODE = True
+PLATE_MAX_CANDIDATES = 8
+PLATE_ASPECT_MIN = 2.0
+PLATE_ASPECT_MAX = 6.5
+PLATE_MIN_AREA_RATIO = 0.0008
+PLATE_MAX_AREA_RATIO = 0.08
+PLATE_MIN_W = 60
+PLATE_MIN_H = 16
+PLATE_BOX_EXPAND = 0.08
+
+NOISE_PATTERN = re.compile(r'^[\W_]+$')
+PLATE_TEXT_PATTERN = re.compile(r'^[A-Z0-9\- ]+$', re.IGNORECASE)
+
 USE_WEBCAM = False
 VIDEO_FILE = "sample_video.mp4"
 
+
+def _is_valid_text(text: str) -> bool:
+    text = text.strip()
+    if len(text) < MIN_TEXT_LENGTH:
+        return False
+    if NOISE_PATTERN.match(text):
+        return False
+    if not re.search(r'[a-zA-Z0-9]', text):
+        return False
+    return True
+
+
+def _is_plate_text(text: str) -> bool:
+    text = text.strip()
+    if len(text) < 4:
+        return False
+    if not re.search(r'[0-9]', text):
+        return False
+    if not PLATE_TEXT_PATTERN.match(text):
+        return False
+    return True
+
+
 def open_video_source():
-    """Open webcam or video file based on USE_WEBCAM flag."""
     if USE_WEBCAM:
-        print("[INFO] Opening webcam...")
+        print("[INFO] Opening webcam (camera index 0)...")
         cap = cv2.VideoCapture(0)
     else:
         if not os.path.exists(VIDEO_FILE):
             print(f"[ERROR] Video file not found: {VIDEO_FILE}")
+            print("[ERROR] Place your video file in the project folder, or change VIDEO_FILE variable.")
             sys.exit(1)
-        print(f"[INFO] Opening video: {VIDEO_FILE}")
+        print(f"[INFO] Opening video file: {VIDEO_FILE}")
         cap = cv2.VideoCapture(VIDEO_FILE)
 
     if not cap.isOpened():
-        print("[ERROR] Could not open video source.")
+        print("[ERROR] Could not open video source. Check your camera or file path.")
         sys.exit(1)
+
     return cap
 
 
-# ─── Preprocessing for OCR ───────────────────────────────────────────────────
-def preprocess_for_ocr(image):
-    """
-    Preprocess a cropped region for better OCR accuracy.
-    Steps: Resize(2x) → Grayscale → Gaussian Blur → Adaptive Threshold
-    """
-    h, w = image.shape[:2]
-    # Step 1: Resize 2x — makes small text larger for Tesseract
-    resized = cv2.resize(image, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-    # Step 2: Grayscale — OCR doesn't need colour info
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    # Step 3: Gaussian Blur — reduces noise/grain
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Step 4: Adaptive Threshold — crisp black/white text
-    binary = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2
-    )
-    return binary
+def _get_confidence_color(confidence: float) -> tuple:
+    if confidence >= 0.70:
+        return (0, 255, 0)
+    if confidence >= 0.40:
+        return (0, 255, 255)
+    return (0, 100, 255)
 
 
-# ─── Multi-Strategy OCR for Best Accuracy ────────────────────────────────────
-import string
+def _prepare_frame_for_ocr(frame):
+    h, w = frame.shape[:2]
+    scale = 1.0
+    max_side = max(h, w)
+    if max_side < OCR_UPSCALE_MAX:
+        scale = OCR_UPSCALE_MAX / max_side
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    return frame, scale
 
-def get_preprocessed_versions(image):
-    """Generate multiple preprocessed versions for different text types."""
-    h, w = image.shape[:2]
-    scale = 1
-    if w < 200 or h < 100:
-        scale = 3
-    elif w < 400 or h < 200:
-        scale = 2
-    if scale > 1:
-        image = cv2.resize(image, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    versions = []
+def _iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    if inter_area == 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    return inter_area / float(area_a + area_b - inter_area + 1e-6)
 
-    # 1. Grayscale
-    versions.append(gray)
-    # 2. Otsu threshold
-    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    versions.append(otsu)
-    # 3. Adaptive threshold
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    adaptive = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4)
-    versions.append(adaptive)
-    # 4. Inverted (for white-on-dark text)
-    _, otsu_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    versions.append(otsu_inv)
-    # 5. Denoised + sharpened
-    denoised = cv2.fastNlMeansDenoising(gray, h=12)
-    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-    sharpened = cv2.filter2D(denoised, -1, kernel)
-    _, sharp_bin = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    versions.append(sharp_bin)
-    return versions
 
-def score_text(text):
-    """Score OCR result for English readability."""
-    if not text or not text.strip():
-        return -1
-    clean = text.strip()
-    total = len(clean)
-    if total == 0:
-        return -1
-    alnum = sum(1 for c in clean if c.isalnum())
-    letters = sum(1 for c in clean if c.isalpha())
-    normal = sum(1 for c in clean if c in string.ascii_letters + string.digits + ' .,;:!?-/()\n')
-    ratio = normal / total
-    if ratio < 0.4:
-        return -1
-    return (alnum * 2) + (letters * 1) + (min(total / 3, 10) * 3) + (ratio * 20)
+def _merge_overlaps(boxes, iou_thresh=0.3):
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    merged = []
+    for box in boxes:
+        merged_box = None
+        for idx, existing in enumerate(merged):
+            if _iou(box, existing) >= iou_thresh:
+                merged_box = (
+                    min(box[0], existing[0]),
+                    min(box[1], existing[1]),
+                    max(box[2], existing[2]),
+                    max(box[3], existing[3]),
+                )
+                merged[idx] = merged_box
+                break
+        if merged_box is None:
+            merged.append(box)
+    return merged
 
-def run_ocr(image):
-    """Run OCR with multiple strategies, return best readable English result."""
+
+def _expand_box(box, frame_w, frame_h, expand_ratio):
+    x1, y1, x2, y2 = box
+    bw = x2 - x1
+    bh = y2 - y1
+    pad_w = int(bw * expand_ratio)
+    pad_h = int(bh * expand_ratio)
+    nx1 = max(0, x1 - pad_w)
+    ny1 = max(0, y1 - pad_h)
+    nx2 = min(frame_w, x2 + pad_w)
+    ny2 = min(frame_h, y2 + pad_h)
+    return nx1, ny1, nx2, ny2
+
+
+def _find_plate_candidates(frame):
+    h, w = frame.shape[:2]
+    min_area = int(h * w * PLATE_MIN_AREA_RATIO)
+    max_area = int(h * w * PLATE_MAX_AREA_RATIO)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    edges = cv2.Canny(gray, 50, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if area < min_area or area > max_area:
+            continue
+        if bw < PLATE_MIN_W or bh < PLATE_MIN_H:
+            continue
+        aspect = bw / float(bh + 1e-6)
+        if aspect < PLATE_ASPECT_MIN or aspect > PLATE_ASPECT_MAX:
+            continue
+        candidates.append((x, y, x + bw, y + bh))
+
+    candidates = _merge_overlaps(candidates)
+    candidates = sorted(candidates, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    return candidates[:PLATE_MAX_CANDIDATES]
+
+
+def run_paddleocr(image, ocr_engine):
     try:
-        versions = get_preprocessed_versions(image)
-        best_text = ""
-        best_score = -1
-        for prep in versions:
-            for psm in [6, 3, 7, 8]:
-                try:
-                    config = f"--oem 3 --psm {psm} -l eng"
-                    raw = pytesseract.image_to_string(prep, config=config)
-                    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-                    text = "\n".join(lines)
-                    sc = score_text(text)
-                    if sc > best_score:
-                        best_score = sc
-                        best_text = text
-                except Exception:
-                    continue
-        return best_text if best_text else "No readable text found"
-    except Exception as e:
-        print(f"[WARNING] OCR error: {e}")
-        return ""
+        ocr_frame, scale = _prepare_frame_for_ocr(image)
+        results = ocr_engine.predict(
+            ocr_frame,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_det_limit_side_len=OCR_DET_LIMIT_SIDE,
+            text_det_limit_type="max",
+            text_det_thresh=OCR_DET_THRESH,
+            text_det_box_thresh=OCR_DET_BOX_THRESH,
+            text_det_unclip_ratio=OCR_DET_UNCLIP,
+            text_rec_score_thresh=OCR_REC_SCORE_THRESH,
+        )
+    except Exception as exc:
+        print(f"[WARNING] PaddleOCR error: {exc}")
+        return []
+
+    detections = []
+    if not results:
+        return detections
+
+    for res in results:
+        if not isinstance(res, dict):
+            continue
+
+        polys = res.get("rec_polys") or []
+        texts = res.get("rec_texts") or []
+        scores = res.get("rec_scores") or []
+
+        for poly, text_item, conf in zip(polys, texts, scores):
+            text = text_item[0] if isinstance(text_item, (list, tuple)) else text_item
+            text = str(text).strip()
+            conf = float(conf)
+
+            if conf < MIN_CONFIDENCE or not _is_valid_text(text):
+                continue
+
+            xs = [int(p[0]) for p in poly]
+            ys = [int(p[1]) for p in poly]
+            x1, x2 = min(xs), max(xs)
+            y1, y2 = min(ys), max(ys)
+
+            if scale != 1.0:
+                x1 = int(x1 / scale)
+                x2 = int(x2 / scale)
+                y1 = int(y1 / scale)
+                y2 = int(y2 / scale)
+
+            detections.append({
+                "bbox": [x1, y1, x2, y2],
+                "text": text,
+                "confidence": conf,
+            })
+
+    return detections
 
 
-# ─── Mouse Drawing State ─────────────────────────────────────────────────────
-# This dictionary tracks the mouse state for drawing rectangles
+def run_plate_ocr(frame, ocr_engine):
+    h, w = frame.shape[:2]
+    candidates = _find_plate_candidates(frame)
+    detections = []
+
+    for box in candidates:
+        x1, y1, x2, y2 = _expand_box(box, w, h, PLATE_BOX_EXPAND)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+
+        crop_dets = run_paddleocr(crop, ocr_engine)
+        for det in crop_dets:
+            if not _is_plate_text(det["text"]):
+                continue
+            bx1, by1, bx2, by2 = det["bbox"]
+            detections.append({
+                "bbox": [bx1 + x1, by1 + y1, bx2 + x1, by2 + y1],
+                "text": det["text"],
+                "confidence": det["confidence"],
+            })
+
+    return detections
+
+
 mouse = {
-    "drawing": False,    # True while mouse button is held down
-    "start_x": 0,       # Starting X of rectangle
-    "start_y": 0,       # Starting Y of rectangle
-    "end_x": 0,         # Current/ending X
-    "end_y": 0,         # Current/ending Y
-    "rect_ready": False, # True when a rectangle has been completed
+    "drawing": False,
+    "start_x": 0,
+    "start_y": 0,
+    "end_x": 0,
+    "end_y": 0,
+    "rect_ready": False,
 }
 
 
 def mouse_callback(event, x, y, flags, param):
-    """
-    Mouse callback function for drawing rectangles on the video frame.
-    - Left button DOWN  → start drawing
-    - Mouse MOVE        → update rectangle end point
-    - Left button UP    → finish drawing, mark rectangle as ready
-    """
     if event == cv2.EVENT_LBUTTONDOWN:
-        # Start drawing a new rectangle
         mouse["drawing"] = True
         mouse["start_x"] = x
         mouse["start_y"] = y
         mouse["end_x"] = x
         mouse["end_y"] = y
         mouse["rect_ready"] = False
-
-    elif event == cv2.EVENT_MOUSEMOVE:
-        if mouse["drawing"]:
-            # Update the end point as mouse moves
-            mouse["end_x"] = x
-            mouse["end_y"] = y
-
+    elif event == cv2.EVENT_MOUSEMOVE and mouse["drawing"]:
+        mouse["end_x"] = x
+        mouse["end_y"] = y
     elif event == cv2.EVENT_LBUTTONUP:
-        # Finish drawing
         mouse["drawing"] = False
         mouse["end_x"] = x
         mouse["end_y"] = y
-        # Only mark ready if the rectangle has some size
+
         dx = abs(mouse["end_x"] - mouse["start_x"])
         dy = abs(mouse["end_y"] - mouse["start_y"])
         if dx > 10 and dy > 10:
             mouse["rect_ready"] = True
 
 
-# ─── Main Loop ───────────────────────────────────────────────────────────────
 def main():
-    if not setup_tesseract():
-        sys.exit(1)
+    print("=" * 60)
+    print("  Loading PaddleOCR (PP-OCR)...")
+    print("  First run downloads models - one-time ~100MB")
+    print("=" * 60)
+
+    ocr_engine = PaddleOCR(
+        use_textline_orientation=True,
+        lang='en',
+        device='cpu',
+        enable_mkldnn=False,
+        enable_cinn=False,
+    )
 
     cap = open_video_source()
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    print(f"[INFO] Video FPS: {fps:.0f}")
 
-    # Create the main video window and attach mouse callback
     cv2.namedWindow("Real-Time OCR Video", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Real-Time OCR Video", 960, 540)
     cv2.setMouseCallback("Real-Time OCR Video", mouse_callback)
 
-    print("[INFO] Video playing. Draw a rectangle with your mouse to OCR a region.")
-    print("[INFO] Press 'c' to clear selection, 'q' to quit.")
+    print("=" * 60)
+    print("  REAL-TIME OCR SYSTEM - RUNNING")
+    print("  Engine: PaddleOCR (PP-OCR detection + recognition)")
+    print("")
+    print("  Press 'a' to toggle auto-detect mode")
+    print("  Draw a rectangle with your mouse for manual OCR")
+    print("  Press 'c' to clear, 'q' to quit")
+    print("=" * 60)
 
-    # Store the last OCR result so it persists until cleared
+    auto_detect_mode = False
+    auto_detections = []
     last_ocr_text = ""
-    last_rect = None  # (x1, y1, x2, y2) of the completed rectangle
+    last_rect = []
+    frame_count = 0
+    fps_display = 0.0
+    fps_timer = time.time()
+    fps_frame_count = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            # If video file ended, loop back to start
             if not USE_WEBCAM:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
-            else:
-                print("[INFO] Camera disconnected.")
-                break
+            print("[INFO] Camera disconnected.")
+            break
 
-        # Resize frame for consistent display
+        frame_count += 1
+
         display_w = 960
         h, w = frame.shape[:2]
         scale = display_w / w
         display_h = int(h * scale)
         display = cv2.resize(frame, (display_w, display_h))
 
-        # ── Draw the rectangle the user is currently dragging ──
-        if mouse["drawing"]:
-            # Draw a CYAN rectangle while dragging (so user can see it)
-            cv2.rectangle(
+        fps_frame_count += 1
+        elapsed = time.time() - fps_timer
+        if elapsed >= 1.0:
+            fps_display = fps_frame_count / elapsed
+            fps_frame_count = 0
+            fps_timer = time.time()
+
+        if auto_detect_mode and frame_count % FRAME_SKIP == 0:
+            if PLATE_ONLY_MODE:
+                auto_detections = run_plate_ocr(display, ocr_engine)
+            else:
+                auto_detections = run_paddleocr(display, ocr_engine)
+
+        if auto_detect_mode:
+            for det in auto_detections:
+                x1, y1, x2, y2 = det["bbox"]
+                text = det["text"]
+                conf = det["confidence"]
+                color = _get_confidence_color(conf)
+
+                cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+                label = f"{text} ({int(conf * 100)}%)"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.6
+                thickness = 2
+                tw, th = cv2.getTextSize(label, font, font_scale, thickness)[0]
+                label_y = y1 - 8
+                if label_y < 20:
+                    label_y = y2 + th + 8
+
+                cv2.rectangle(
+                    display,
+                    (x1, label_y - th - 4),
+                    (x1 + tw + 8, label_y + 4),
+                    (0, 0, 0),
+                    -1,
+                )
+                cv2.putText(display, label, (x1 + 4, label_y - 2), font, font_scale, color, thickness)
+
+        if mouse["drawing"] or mouse["rect_ready"]:
+            x1, y1 = mouse["start_x"], mouse["start_y"]
+            x2, y2 = mouse["end_x"], mouse["end_y"]
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+        if mouse["rect_ready"]:
+            x1, y1 = mouse["start_x"], mouse["start_y"]
+            x2, y2 = mouse["end_x"], mouse["end_y"]
+            x1, x2 = sorted([x1, x2])
+            y1, y2 = sorted([y1, y2])
+
+            if x2 > x1 and y2 > y1:
+                crop = display[y1:y2, x1:x2]
+                detections = run_paddleocr(crop, ocr_engine)
+                last_ocr_text = " ".join([d["text"] for d in detections]) or "No text detected"
+                last_rect = [x1, y1, x2, y2]
+
+                zoom_w = 520
+                crop_h, crop_w = crop.shape[:2]
+                zoom_scale = zoom_w / crop_w if crop_w > 0 else 1
+                zoom_h = max(int(crop_h * zoom_scale), 50)
+                zoomed = cv2.resize(crop, (zoom_w, zoom_h), interpolation=cv2.INTER_CUBIC)
+                cv2.imshow("Zoomed Region", zoomed)
+
+            mouse["rect_ready"] = False
+
+        if last_ocr_text and last_rect:
+            cv2.putText(
                 display,
-                (mouse["start_x"], mouse["start_y"]),
-                (mouse["end_x"], mouse["end_y"]),
-                (255, 255, 0),  # Cyan color
-                2
+                f"Manual: {last_ocr_text}",
+                (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
             )
 
-        # ── When user finishes drawing a rectangle ──
-        if mouse["rect_ready"]:
-            # Calculate the rectangle coordinates (handle any drag direction)
-            x1 = min(mouse["start_x"], mouse["end_x"])
-            y1 = min(mouse["start_y"], mouse["end_y"])
-            x2 = max(mouse["start_x"], mouse["end_x"])
-            y2 = max(mouse["start_y"], mouse["end_y"])
-
-            # Clamp to frame boundaries
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(display_w, x2)
-            y2 = min(display_h, y2)
-
-            # Store the rectangle
-            last_rect = (x1, y1, x2, y2)
-
-            # Crop the selected region from the display frame
-            cropped = display[y1:y2, x1:x2]
-
-            if cropped.size > 0:
-                # Preprocess and run OCR on the cropped region
-                preprocessed = preprocess_for_ocr(cropped)
-                last_ocr_text = run_ocr(preprocessed)
-
-                if last_ocr_text:
-                    print(f"[OCR RESULT] {last_ocr_text}")
-
-            # Mark as processed (don't re-run OCR every frame)
-            mouse["rect_ready"] = False
-
-        # ── Draw the persistent GREEN rectangle on the frame ──
-        if last_rect is not None:
-            x1, y1, x2, y2 = last_rect
-            # Draw GREEN rectangle around selected area
-            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            # ── Show OCR text in GREEN above the rectangle ──
-            if last_ocr_text:
-                # Split text into lines and draw each above the box
-                lines = last_ocr_text.split("\n")
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.8
-                thickness = 2
-                line_gap = 30
-
-                for i, line in enumerate(lines):
-                    text_y = y1 - 10 - (len(lines) - 1 - i) * line_gap
-                    if text_y < 20:
-                        text_y = y2 + 25 + i * line_gap  # Put below if no space above
-
-                    # Black background for readability
-                    (tw, th), _ = cv2.getTextSize(line, font, font_scale, thickness)
-                    cv2.rectangle(display, (x1, text_y - th - 5), (x1 + tw + 10, text_y + 5), (0, 0, 0), -1)
-                    # Green text
-                    cv2.putText(display, line, (x1 + 5, text_y), font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
-
-            # ── Show ZOOMED view in separate window ──
-            cropped_region = display[y1:y2, x1:x2]
-            if cropped_region.size > 0:
-                # Zoom the cropped region to 500px wide
-                crop_h, crop_w = cropped_region.shape[:2]
-                zoom_w = 500
-                zoom_scale = zoom_w / crop_w if crop_w > 0 else 1
-                zoom_h = int(crop_h * zoom_scale)
-                zoomed = cv2.resize(cropped_region, (zoom_w, max(zoom_h, 50)), interpolation=cv2.INTER_CUBIC)
-
-                # Add green border
-                cv2.rectangle(zoomed, (0, 0), (zoomed.shape[1] - 1, zoomed.shape[0] - 1), (0, 255, 0), 3)
-
-                # Add OCR text at the bottom of zoomed view
-                if last_ocr_text:
-                    text_lines = last_ocr_text.split("\n")
-                    # Add black bar at bottom for text
-                    bar_height = 35 * len(text_lines) + 10
-                    text_bar = np.zeros((bar_height, zoom_w, 3), dtype=np.uint8)
-                    for i, line in enumerate(text_lines):
-                        cv2.putText(
-                            text_bar, line, (10, 30 + i * 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA
-                        )
-                    # Stack zoomed image with text bar
-                    zoomed = np.vstack([zoomed, text_bar])
-
-                cv2.imshow("Zoomed Text Region", zoomed)
-
-        # ── Draw instructions on the frame ──
-        cv2.rectangle(display, (0, 0), (display_w, 30), (0, 0, 0), -1)
         cv2.putText(
-            display, "Draw rectangle on text to OCR  |  'c' = clear  |  'q' = quit",
-            (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA
+            display,
+            f"FPS: {fps_display:.1f}",
+            (10, display_h - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (200, 200, 200),
+            1,
         )
 
-        # ── Show main video window ──
         cv2.imshow("Real-Time OCR Video", display)
-
-        # ── Keyboard Controls ──
         key = cv2.waitKey(1) & 0xFF
-
-        # Press 'q' to quit
-        if key == ord("q") or key == ord("Q"):
-            print("[INFO] Quitting...")
+        if key == ord('q'):
             break
-
-        # Press 'c' to clear the selection
-        if key == ord("c") or key == ord("C"):
-            last_rect = None
+        if key == ord('a'):
+            auto_detect_mode = not auto_detect_mode
+        if key == ord('c'):
             last_ocr_text = ""
-            mouse["rect_ready"] = False
-            try:
-                cv2.destroyWindow("Zoomed Text Region")
-            except Exception:
-                pass
-            print("[INFO] Selection cleared.")
+            last_rect = []
+            if cv2.getWindowProperty("Zoomed Region", cv2.WND_PROP_VISIBLE) >= 1:
+                cv2.destroyWindow("Zoomed Region")
 
-    # ── Cleanup ──
     cap.release()
     cv2.destroyAllWindows()
-    print("[INFO] Program exited cleanly.")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

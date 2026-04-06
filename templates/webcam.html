@@ -1,12 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Webcam — Real-Time OCR System</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
+        rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
 </head>
+
 <body>
     <nav class="navbar">
         <a href="/" class="nav-brand">
@@ -23,7 +26,7 @@
     <main class="app-main">
         <div class="page-header">
             <h1 class="page-title">Live Webcam — Text Recognition</h1>
-            <p class="page-desc">Start your camera, draw a rectangle on any text to detect and read it</p>
+            <p class="page-desc">Start your camera — auto-detect text or draw a rectangle to select a region</p>
         </div>
 
         <div class="workspace">
@@ -34,6 +37,8 @@
                         <span id="statusText">Camera Off</span>
                     </div>
                     <div class="panel-buttons">
+                        <button class="btn btn-auto" id="btnAutoDetect" style="display:none;"
+                            title="Automatically detect all text in the camera feed">⚡ Auto-Detect</button>
                         <button class="btn btn-start" id="btnStart">▶ Start Camera</button>
                         <button class="btn btn-stop" id="btnStop" style="display:none;">■ Stop</button>
                     </div>
@@ -44,12 +49,30 @@
                         <p>Click "Start Camera" to begin</p>
                     </div>
                     <video id="camVideo" class="video-player" style="display:none;" autoplay playsinline muted></video>
+                    <!-- Canvas overlay for auto-detect bounding boxes -->
+                    <canvas id="overlayCanvas" class="overlay-canvas" style="display:none;"></canvas>
                     <div class="select-box" id="selectBox"></div>
                 </div>
-                <div class="panel-hint">🖱️ Click & drag to select text region — zoom clears after 5s, text after 10s</div>
+                <div class="panel-hint">🖱️ Click & drag to select text region | ⚡ Auto-Detect: finds all text
+                    automatically</div>
             </div>
 
             <div class="results-panel">
+                <!-- Auto-detect results panel -->
+                <div class="result-box" id="autoDetectPanel" style="display:none;">
+                    <div class="result-title">⚡ Auto-Detect Results <span class="auto-badge"
+                            id="autoStatus">OFF</span></div>
+                    <div class="auto-results-area">
+                        <div class="auto-stats" id="autoStats">
+                            <span id="detCount">0 texts found</span>
+                            <span id="detTime">—</span>
+                        </div>
+                        <div class="auto-results-list" id="autoResultsList">
+                            <p class="empty-msg">Toggle Auto-Detect to start</p>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="result-box">
                     <div class="result-title">🔍 Zoomed Region</div>
                     <div class="zoom-area">
@@ -71,6 +94,7 @@
     <script>
         const btnStart = document.getElementById('btnStart');
         const btnStop = document.getElementById('btnStop');
+        const btnAutoDetect = document.getElementById('btnAutoDetect');
         const camVideo = document.getElementById('camVideo');
         const placeholder = document.getElementById('placeholder');
         const videoArea = document.getElementById('videoArea');
@@ -81,9 +105,16 @@
         const textEmpty = document.getElementById('textEmpty');
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
+        const overlayCanvas = document.getElementById('overlayCanvas');
+        const autoDetectPanel = document.getElementById('autoDetectPanel');
+        const autoStatus = document.getElementById('autoStatus');
+        const autoResultsList = document.getElementById('autoResultsList');
+        const detCount = document.getElementById('detCount');
+        const detTime = document.getElementById('detTime');
 
         let stream = null, camReady = false, drawing = false, sx, sy;
         let zoomTimer = null, textTimer = null;
+        let autoDetectOn = false, autoDetectInterval = null;
 
         // Start camera
         btnStart.addEventListener('click', async () => {
@@ -94,6 +125,8 @@
                 placeholder.style.display = 'none';
                 btnStart.style.display = 'none';
                 btnStop.style.display = 'inline-flex';
+                btnAutoDetect.style.display = 'inline-flex';
+                autoDetectPanel.style.display = 'block';
                 statusDot.classList.add('on');
                 statusText.textContent = 'Camera Active';
                 camReady = true;
@@ -104,20 +137,172 @@
 
         // Stop camera
         btnStop.addEventListener('click', () => {
+            stopAutoDetect();
             if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
             camVideo.srcObject = null;
             camVideo.style.display = 'none';
             placeholder.style.display = 'flex';
             btnStop.style.display = 'none';
             btnStart.style.display = 'inline-flex';
+            btnAutoDetect.style.display = 'none';
+            autoDetectPanel.style.display = 'none';
+            overlayCanvas.style.display = 'none';
             statusDot.classList.remove('on');
             statusText.textContent = 'Camera Off';
             camReady = false;
         });
 
-        // Mouse selection
+        // ══════════════════════════════════════════════════════════════
+        // AUTO-DETECT MODE
+        // ══════════════════════════════════════════════════════════════
+        btnAutoDetect.addEventListener('click', () => {
+            if (autoDetectOn) {
+                stopAutoDetect();
+            } else {
+                startAutoDetect();
+            }
+        });
+
+        function startAutoDetect() {
+            autoDetectOn = true;
+            btnAutoDetect.textContent = '■ Stop Auto-Detect';
+            btnAutoDetect.classList.add('btn-auto-active');
+            autoStatus.textContent = 'ON';
+            autoStatus.classList.add('on');
+
+            overlayCanvas.style.display = 'block';
+            resizeOverlay();
+
+            autoDetectInterval = setInterval(runAutoDetect, 800);
+            runAutoDetect();
+        }
+
+        function stopAutoDetect() {
+            autoDetectOn = false;
+            btnAutoDetect.textContent = '⚡ Auto-Detect';
+            btnAutoDetect.classList.remove('btn-auto-active');
+            autoStatus.textContent = 'OFF';
+            autoStatus.classList.remove('on');
+
+            if (autoDetectInterval) {
+                clearInterval(autoDetectInterval);
+                autoDetectInterval = null;
+            }
+
+            const ctx = overlayCanvas.getContext('2d');
+            ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            overlayCanvas.style.display = 'none';
+
+            autoResultsList.innerHTML = '<p class="empty-msg">Toggle Auto-Detect to start</p>';
+            detCount.textContent = '0 texts found';
+            detTime.textContent = '—';
+        }
+
+        function resizeOverlay() {
+            overlayCanvas.width = videoArea.offsetWidth;
+            overlayCanvas.height = videoArea.offsetHeight;
+        }
+
+        async function runAutoDetect() {
+            if (!camReady || !autoDetectOn) return;
+
+            const capture = document.createElement('canvas');
+            capture.width = camVideo.videoWidth;
+            capture.height = camVideo.videoHeight;
+            capture.getContext('2d').drawImage(camVideo, 0, 0, capture.width, capture.height);
+
+            capture.toBlob(async blob => {
+                const fd = new FormData();
+                fd.append('frame', blob, 'frame.jpg');
+
+                try {
+                    const res = await fetch('/ocr_auto_detect', { method: 'POST', body: fd });
+                    const data = await res.json();
+
+                    if (!autoDetectOn) return;
+
+                    resizeOverlay();
+                    const ctx = overlayCanvas.getContext('2d');
+                    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+                    const scX = overlayCanvas.width / capture.width;
+                    const scY = overlayCanvas.height / capture.height;
+
+                    const detections = data.detections || [];
+                    detCount.textContent = detections.length + ' texts found';
+                    detTime.textContent = (data.process_time_ms || 0).toFixed(0) + 'ms';
+
+                    detections.forEach(det => {
+                        const [x1, y1, x2, y2] = det.bbox;
+                        const sx1 = x1 * scX, sy1 = y1 * scY;
+                        const sw = (x2 - x1) * scX, sh = (y2 - y1) * scY;
+
+                        let color;
+                        if (det.confidence >= 0.70) color = '#22c55e';
+                        else if (det.confidence >= 0.40) color = '#eab308';
+                        else color = '#ef4444';
+
+                        ctx.strokeStyle = color;
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(sx1, sy1, sw, sh);
+
+                        const label = `${det.text} (${Math.round(det.confidence * 100)}%)`;
+                        ctx.font = '600 13px Inter, sans-serif';
+                        const tw = ctx.measureText(label).width;
+                        const labelY = sy1 > 22 ? sy1 - 6 : sy1 + sh + 16;
+
+                        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                        ctx.fillRect(sx1, labelY - 15, tw + 10, 20);
+
+                        ctx.fillStyle = color;
+                        ctx.fillText(label, sx1 + 5, labelY - 1);
+                    });
+
+                    if (detections.length > 0) {
+                        autoResultsList.innerHTML = detections.map(det => {
+                            const conf = Math.round(det.confidence * 100);
+                            let confClass = 'conf-high';
+                            if (conf < 40) confClass = 'conf-low';
+                            else if (conf < 70) confClass = 'conf-med';
+                            return `<div class="auto-result-item">
+                                <span class="auto-result-text">${det.text}</span>
+                                <span class="auto-result-conf ${confClass}">${conf}%</span>
+                            </div>`;
+                        }).join('');
+                    } else {
+                        autoResultsList.innerHTML = '<p class="empty-msg">No text detected in this frame</p>';
+                    }
+
+                    // Update Zoom and OCR Result Panels for Auto-Detect
+                    if (data.zoomed_image) {
+                        zoomImg.src = data.zoomed_image;
+                        zoomImg.style.display = 'block';
+                        zoomEmpty.style.display = 'none';
+
+                        ocrResult.textContent = data.zoomed_text || 'No text detected';
+                        ocrResult.style.display = 'block';
+                        textEmpty.style.display = 'none';
+                    } else if (detections.length === 0) {
+                        zoomImg.style.display = 'none';
+                        zoomEmpty.style.display = 'block';
+                        zoomEmpty.textContent = 'Draw a rectangle to zoom';
+
+                        ocrResult.style.display = 'none';
+                        textEmpty.style.display = 'block';
+                        textEmpty.textContent = 'OCR results appear here';
+                    }
+
+                } catch (err) {
+                    console.error('Auto-detect error:', err);
+                }
+            }, 'image/jpeg', 0.85);
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // MANUAL MODE — Mouse selection
+        // ══════════════════════════════════════════════════════════════
         videoArea.addEventListener('mousedown', e => {
-            if (!camReady) return;
+            if (!camReady || autoDetectOn) return;
             const r = videoArea.getBoundingClientRect();
             sx = e.clientX - r.left; sy = e.clientY - r.top;
             drawing = true;
@@ -145,7 +330,6 @@
             const x2 = Math.max(sx, ex), y2 = Math.max(sy, ey);
             if ((x2 - x1) < 10 || (y2 - y1) < 10) { selectBox.style.display = 'none'; return; }
 
-            // Hide selection box after drawing
             setTimeout(() => { selectBox.style.display = 'none'; }, 500);
 
             const canvas = document.createElement('canvas');
@@ -155,7 +339,7 @@
             const scX = canvas.width / videoArea.offsetWidth;
             const scY = canvas.height / videoArea.offsetHeight;
 
-            ocrResult.textContent = 'Processing...';
+            ocrResult.textContent = 'Processing with EasyOCR...';
             ocrResult.style.display = 'block'; textEmpty.style.display = 'none';
 
             canvas.toBlob(async blob => {
@@ -169,7 +353,6 @@
                     const res = await fetch('/ocr_region', { method: 'POST', body: fd });
                     const data = await res.json();
 
-                    // Show zoomed image — auto-clear after 5 seconds
                     if (data.zoomed_image) {
                         zoomImg.src = data.zoomed_image;
                         zoomImg.style.display = 'block'; zoomEmpty.style.display = 'none';
@@ -180,7 +363,6 @@
                         }, 5000);
                     }
 
-                    // Show OCR text — auto-clear after 10 seconds
                     ocrResult.textContent = data.text || 'No text detected';
                     if (textTimer) clearTimeout(textTimer);
                     textTimer = setTimeout(() => {
@@ -192,6 +374,11 @@
                 }
             }, 'image/jpeg', 0.9);
         });
+
+        window.addEventListener('resize', () => {
+            if (autoDetectOn) resizeOverlay();
+        });
     </script>
 </body>
+
 </html>

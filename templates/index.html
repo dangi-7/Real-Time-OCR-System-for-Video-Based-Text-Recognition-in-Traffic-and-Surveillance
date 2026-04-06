@@ -1,12 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Real-Time OCR System for Video-Based Text Recognition in Traffic and Surveillance</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
+        rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
 </head>
+
 <body>
     <nav class="navbar">
         <a href="/" class="nav-brand">
@@ -28,14 +31,15 @@
         </h1>
 
         <p class="home-desc">
-            Detect and read text from traffic videos and surveillance footage — 
-            vehicle license plates, road signboards, and CCTV text — in real-time.
+            Detect and read text from traffic videos and surveillance footage —
+            vehicle license plates, road signboards, and CCTV text — in real-time
+            using PaddleOCR's deep learning detection and recognition.
         </p>
 
         <div class="home-tech">
             <span class="tech-pill">Python</span>
             <span class="tech-pill">OpenCV</span>
-            <span class="tech-pill">Tesseract OCR</span>
+            <span class="tech-pill">PaddleOCR</span>
             <span class="tech-pill">NumPy</span>
             <span class="tech-pill">Flask</span>
         </div>
@@ -44,19 +48,20 @@
             <a href="/webcam" class="home-card">
                 <div class="home-card-icon">📷</div>
                 <h3>Live Webcam</h3>
-                <p>Use your camera for real-time text detection from live video feed</p>
+                <p>Use your camera for real-time text detection — auto-detect or manual selection</p>
                 <div class="home-card-btn">Open Webcam →</div>
             </a>
 
             <a href="/upload" class="home-card">
                 <div class="home-card-icon">📁</div>
                 <h3>Upload Video</h3>
-                <p>Upload traffic or surveillance footage to detect and read text</p>
+                <p>Upload traffic or surveillance footage to automatically detect and read text</p>
                 <div class="home-card-btn">Upload Video →</div>
             </a>
         </div>
 
-        <p class="home-footer">Built with Python, OpenCV & Tesseract OCR</p>
+        <p class="home-footer">Built with Python, OpenCV & PaddleOCR</p>
     </main>
 </body>
+
 </html>

@@ -1,8 +1,8 @@
 # Real-Time OCR System for Video-Based Text Recognition in Traffic and Surveillance
 
-## 📌 Project Overview
+A real-time OCR system that detects and reads text from traffic videos and surveillance footage (number plates, signboards, CCTV overlays) using PaddleOCR.
 
-This project develops a **real-time OCR (Optical Character Recognition) system** that extracts and recognizes text from traffic and surveillance video feeds. It processes live video frames to detect and read text such as:
+## OCR Engine: PaddleOCR (PP-OCR)
 
 - 🚗 **Vehicle license plates** (e.g., MH12AB1234)
 - 🚌 **Bus route numbers** (e.g., 567)
@@ -11,9 +11,19 @@ This project develops a **real-time OCR (Optical Character Recognition) system**
 
 The system handles real-world challenges like motion blur, low resolution, varying lighting conditions, and complex backgrounds using **deep learning-based OCR (EasyOCR)**.
 
----
+PaddleOCR provides an end-to-end pipeline that handles both text detection and text recognition in one model family. It works on CPU and can use GPU if available.
 
-## 🛠️ Technologies Used
+## Features
+
+
+- Auto-detect mode: detects all text regions in a running video stream
+- Manual mode: draw a rectangle to read a specific region
+- Web interface (Flask) for webcam and uploaded video
+- Standalone desktop interface (OpenCV)
+- Confidence-based filtering to remove noise
+
+## Tech Stack
+
 
 | Technology | Purpose |
 |---|---|
@@ -24,9 +34,30 @@ The system handles real-world challenges like motion blur, low resolution, varyi
 | **Flask** | Lightweight Python web framework for serving the web application |
 | **HTML/CSS/JavaScript** | Frontend — UI design, video player, rectangle drawing, results display |
 
----
+- Python
+- Flask
+- OpenCV
+- PaddleOCR
+- NumPy
 
-## 📋 Features
+
+## Project Structure
+
+```
+├── app.py                 # Flask web application
+├── ocr_video.py           # Standalone OpenCV application
+├── debug_ocr.py           # Lightweight OCR debug script
+├── requirements.txt       # Python dependencies
+├── static/
+│   └── css/
+│       └── style.css      # UI stylesheet
+├── templates/
+│   ├── index.html         # Home page
+│   ├── upload.html        # Upload video page
+│   └── webcam.html        # Webcam page
+└── uploads/               # Uploaded videos
+```
+
 
 ### Web Application (`app.py`)
 1. ✅ **Home page** — Professional dark theme with project title and navigation
@@ -72,16 +103,18 @@ EasyOCR uses deep learning models that are specifically trained for **scene text
 - Low resolution and motion blur
 - Complex backgrounds and varying fonts
 - Different lighting conditions (shadows, night, reflections)
+=======
+## Installation
+>>>>>>> 3873b6a (clean project commit)
 
----
-
-## 🚀 Installation & Setup
-
-### Step 1: Install Python Dependencies
+Recommended Python version: 3.10
 
 ```bash
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
 
 This installs:
 - `opencv-python` — Video and image processing
@@ -93,23 +126,45 @@ This installs:
 
 ### Step 2: Run the Web Application
 
+First run will download PaddleOCR model weights (~100MB).
+
+## Usage
+
+### Web Interface (Recommended)
+
+
 ```bash
 python app.py
 ```
+
 
 Open **http://localhost:5000** in your browser.
 
 ### Step 3 (Optional): Run the Desktop Version
 
+Open http://localhost:5000 in your browser.
+
+### Standalone Desktop App
+
+
 ```bash
 python ocr_video.py
 ```
+
 
 > **Note:** For the desktop version, place your video file as `sample_video.mp4` in the project folder, or change the `VIDEO_FILE` variable in `ocr_video.py`.
 
 ---
 
-## 🎮 How to Use
+Controls:
+- Press 'a' to toggle auto-detect mode
+- Draw a rectangle to run manual OCR
+- Press 'c' to clear manual selection
+- Press 'q' to quit
+
+
+## Notes
+
 
 ### Web Application
 1. Open **http://localhost:5000** in your browser
@@ -169,3 +224,7 @@ Real-Time-OCR-System/
 ## 📝 License
 
 This project is created for educational purposes as a Final Year Major Project.
+
+- If you use a GPU, set `use_gpu=True` in the PaddleOCR initialization.
+- For best results on small text, keep the video resolution reasonably high.
+
